@@ -32,7 +32,15 @@ import { WebhooksModule } from './webhooks/webhooks.module';
       useFactory: (config: ConfigService) => {
         const redisUrl = config.get<string>('REDIS_URL');
         if (redisUrl) {
-          return { connection: { url: redisUrl } };
+          const parsed = new URL(redisUrl);
+          return {
+            connection: {
+              host: parsed.hostname,
+              port: parseInt(parsed.port) || 6379,
+              password: parsed.password || undefined,
+              username: parsed.username || undefined,
+            },
+          };
         }
         return {
           connection: {
