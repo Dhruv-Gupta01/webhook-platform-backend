@@ -10,24 +10,39 @@ A production-ready webhook management platform built with NestJS. Allows users t
 
 ## System Design
 
-```
-                    [React Frontend (Vercel)]
-                       |            ^
-                  REST + JWT    SSE (real-time)
-                       v            |
-[External Source] --> [NestJS API Server (Railway)] <--> [PostgreSQL]
-  (GitHub, Stripe)         |                                  ^
-                           | Enqueue Job                      |
-                           v                                  |
-                     [Redis + BullMQ Queue]                    |
-                           |                                  |
-                           | Dequeue & Process                |
-                           v                                  |
-                     [Delivery Worker] --- Update Status ------+
-                           |
-                           | HTTP POST (with exponential backoff retry)
-                           v
-                     [Customer Callback URL]
+```mermaid
+flowchart TD
+    subgraph Vercel
+        FE["React Frontend\n(Vite + TypeScript)"]
+    end
+
+    subgraph Railway
+        API["NestJS API Server\nAuth / Webhooks / Events\nHMAC-SHA256 Verification"]
+        PG[("PostgreSQL\nSubscriptions / Events / Users")]
+        REDIS["Redis + BullMQ\nJob Queue"]
+        WORKER["Delivery Worker\n(BullMQ Processor)"]
+    end
+
+    SRC["External Source\n(GitHub, Stripe, Shopify)"]
+    CB["Customer\nCallback URL"]
+
+    FE -- "REST API + JWT" --> API
+    API -. "SSE (real-time updates)" .-> FE
+
+    SRC -- "POST /incoming/:id" --> API
+    API -- "Read / Write" --> PG
+    API -- "Enqueue Job" --> REDIS
+    REDIS -- "Dequeue & Process" --> WORKER
+    WORKER -- "HTTP POST\n(exponential backoff retry)" --> CB
+    WORKER -. "Update Status" .-> PG
+
+    style FE fill:#a5d8ff,stroke:#1971c2,color:#000
+    style API fill:#b2f2bb,stroke:#2f9e44,color:#000
+    style PG fill:#ffd8a8,stroke:#e67700,color:#000
+    style REDIS fill:#ffc9c9,stroke:#c92a2a,color:#000
+    style WORKER fill:#d0bfff,stroke:#6741d9,color:#000
+    style SRC fill:#e9ecef,stroke:#495057,color:#000
+    style CB fill:#e9ecef,stroke:#495057,color:#000
 ```
 
 **Flow:**
