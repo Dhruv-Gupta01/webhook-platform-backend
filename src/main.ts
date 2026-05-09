@@ -42,15 +42,8 @@ async function bootstrap() {
   // Global exception filter — uniform error shape across all endpoints
   app.useGlobalFilters(new GlobalExceptionFilter());
 
-  const allowedOrigins = (process.env.CORS_ORIGIN ?? 'http://localhost:5173')
-    .split(',')
-    .map((o) => o.trim());
-
   app.enableCors({
-    origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
-      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-      callback(new Error('Not allowed by CORS'));
-    },
+    origin: true,
     credentials: true,
   });
 
