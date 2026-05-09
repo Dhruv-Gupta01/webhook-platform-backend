@@ -47,8 +47,7 @@ async function bootstrap() {
     .map((o) => o.trim());
 
   app.enableCors({
-    origin: (origin, callback) => {
-      // Allow requests with no origin (curl, Postman, server-to-server)
+    origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
       if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
       callback(new Error('Not allowed by CORS'));
     },
