@@ -26,18 +26,22 @@ import { WebhooksModule } from './webhooks/webhooks.module';
       }),
     }),
 
-    // Global BullMQ connection — all queues in any module share this Redis connection
-    // forRootAsync reads Redis config from .env via ConfigService
     BullModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        connection: {
-          host: config.get<string>('REDIS_HOST', 'localhost'),
-          port: config.get<number>('REDIS_PORT', 6379),
-          password: config.get<string>('REDIS_PASSWORD') || undefined,
-        },
-      }),
+      useFactory: (config: ConfigService) => {
+        const redisUrl = config.get<string>('REDIS_URL');
+        if (redisUrl) {
+          return { connection: { url: redisUrl } };
+        }
+        return {
+          connection: {
+            host: config.get<string>('REDIS_HOST', 'localhost'),
+            port: config.get<number>('REDIS_PORT', 6379),
+            password: config.get<string>('REDIS_PASSWORD') || undefined,
+          },
+        };
+      },
     }),
 
     EventEmitterModule.forRoot(), // in-process event bus for SSE streaming
