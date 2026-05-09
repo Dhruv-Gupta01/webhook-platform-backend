@@ -1,98 +1,224 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# WebhookHub - Backend
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+A production-ready webhook management platform built with NestJS. Allows users to subscribe to webhooks from external services, receive events, and reliably deliver them to callback URLs with automatic retries.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+**Live Backend:** https://webhook-platform-backend-production.up.railway.app/api  
+**Live Frontend:** https://webhook-platform-frontend.vercel.app  
+**Queue Dashboard:** https://webhook-platform-backend-production.up.railway.app/admin/queues
 
-## Description
+---
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## System Design
 
-## Project setup
-
-```bash
-$ npm install
+```
+                    [React Frontend (Vercel)]
+                       |            ^
+                  REST + JWT    SSE (real-time)
+                       v            |
+[External Source] --> [NestJS API Server (Railway)] <--> [PostgreSQL]
+  (GitHub, Stripe)         |                                  ^
+                           | Enqueue Job                      |
+                           v                                  |
+                     [Redis + BullMQ Queue]                    |
+                           |                                  |
+                           | Dequeue & Process                |
+                           v                                  |
+                     [Delivery Worker] --- Update Status ------+
+                           |
+                           | HTTP POST (with exponential backoff retry)
+                           v
+                     [Customer Callback URL]
 ```
 
-## Compile and run the project
+**Flow:**
+1. External source (GitHub, Stripe, etc.) sends a webhook POST to `/api/webhooks/incoming/:id`
+2. API server verifies HMAC-SHA256 signature, applies event type filtering, and stores the event in PostgreSQL
+3. A delivery job is enqueued into BullMQ (backed by Redis)
+4. The Delivery Worker picks up the job and POSTs the payload to the subscriber's callback URL
+5. On failure, BullMQ retries with exponential backoff (3s, 9s, 27s, 81s, 243s -- up to 5 attempts)
+6. Frontend receives real-time status updates via Server-Sent Events (SSE)
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Framework | NestJS 11 (Express) |
+| Database | PostgreSQL + TypeORM |
+| Queue | BullMQ + Redis |
+| Auth | JWT (Passport) |
+| Security | HMAC-SHA256 webhook signature verification |
+| Real-time | Server-Sent Events (SSE) |
+| Queue UI | Bull Board |
+
+---
+
+## Design Choices & Architecture
+
+### Why BullMQ + Redis over RabbitMQ/Kafka?
+BullMQ provides reliable job processing with built-in retry strategies, backoff, and job persistence -- all backed by Redis. For a webhook delivery system, this is the right level of complexity. Kafka/RabbitMQ would add operational overhead without meaningful benefit at this scale.
+
+### Why SSE over WebSockets?
+Server-Sent Events are unidirectional (server to client), which is exactly what we need for live event status updates. SSE is simpler than WebSockets, works over standard HTTP, auto-reconnects natively in browsers, and doesn't require a separate protocol upgrade.
+
+### Why HMAC-SHA256 Signing?
+Every subscription gets a unique secret. When the platform delivers an event to a callback URL, it signs the payload with HMAC-SHA256. The subscriber can verify the signature to ensure the request genuinely came from WebhookHub. This is the same approach used by GitHub, Stripe, and Shopify.
+
+### Retry Strategy
+Failed deliveries use exponential backoff: `delay = 3^attempt` seconds (3s, 9s, 27s, 81s, 243s). After 5 failed attempts, the event is marked as permanently FAILED. Users can manually retry failed events from the dashboard, which creates a fresh delivery job.
+
+### Event Filtering
+Subscriptions can optionally specify allowed event types (e.g., `push`, `payment.succeeded`). Events not matching the filter are silently dropped at ingestion. The event type is read from standard headers (`x-github-event`, `x-event-type`, `x-hook-event`).
+
+### Global Exception Filter
+A custom `GlobalExceptionFilter` ensures all API errors return a consistent JSON shape regardless of where the error originates (validation, auth, database, etc).
+
+---
+
+## API Endpoints
+
+### Auth
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | `/api/auth/register` | Register a new user | No |
+| POST | `/api/auth/login` | Login, returns JWT | No |
+| GET | `/api/auth/me` | Get current user | JWT |
+
+### Webhooks
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | `/api/webhooks/subscribe` | Create a subscription | JWT |
+| GET | `/api/webhooks` | List all subscriptions | JWT |
+| GET | `/api/webhooks/:id` | Get subscription details | JWT |
+| PATCH | `/api/webhooks/:id/cancel` | Cancel a subscription | JWT |
+| DELETE | `/api/webhooks/:id` | Delete subscription + events | JWT |
+
+### Events
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | `/api/webhooks/incoming/:id` | Receive webhook from external source | Public |
+| GET | `/api/webhooks/:subId/events` | List events (paginated) | JWT |
+| GET | `/api/webhooks/:subId/events/:eventId` | Get event details | JWT |
+| POST | `/api/webhooks/:subId/events/:eventId/retry` | Manually retry a failed event | JWT |
+| GET | `/api/webhooks/:subId/events/stream` | SSE stream for real-time updates | JWT (query param) |
+| GET | `/api/webhooks/:subId/stats` | Delivery statistics | JWT |
+
+### Example: Send a webhook
 
 ```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+curl -X POST http://localhost:3000/api/webhooks/incoming/<subscription-id> \
+  -H "Content-Type: application/json" \
+  -H "x-event-type: payment.succeeded" \
+  -d '{"amount": 2999, "currency": "INR", "customer": "alice@example.com"}'
 ```
 
-## Run tests
+---
+
+## Local Setup
+
+### Prerequisites
+- Node.js 18+
+- PostgreSQL
+- Redis
+
+### 1. Clone and install
 
 ```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+git clone https://github.com/Dhruv-Gupta01/webhook-platform-backend.git
+cd webhook-platform-backend
+npm install
 ```
 
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+### 2. Configure environment
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+cp .env.example .env
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+Edit `.env` with your local credentials:
 
-## Resources
+```env
+DATABASE_HOST=localhost
+DATABASE_PORT=5432
+DATABASE_USER=webhook_user
+DATABASE_PASSWORD=webhook_pass
+DATABASE_NAME=webhook_db
 
-Check out a few resources that may come in handy when working with NestJS:
+JWT_SECRET=super-secret-change-me-in-production-min-32-chars
+JWT_EXPIRES_IN=7d
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+PORT=3000
+APP_URL=http://localhost:3000
 
-## Support
+REDIS_HOST=localhost
+REDIS_PORT=6379
+```
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+### 3. Start PostgreSQL and Redis
 
-## Stay in touch
+Using Docker (recommended):
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+```bash
+docker run -d --name webhook-postgres -p 5432:5432 \
+  -e POSTGRES_USER=webhook_user \
+  -e POSTGRES_PASSWORD=webhook_pass \
+  -e POSTGRES_DB=webhook_db \
+  postgres:16
 
-## License
+docker run -d --name webhook-redis -p 6379:6379 redis:7
+```
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+### 4. Run the server
+
+```bash
+npm run start:dev
+```
+
+Server starts at `http://localhost:3000/api` and Bull Board at `http://localhost:3000/admin/queues`.
+
+---
+
+## Webhook Simulator
+
+A standalone script to test the full flow end-to-end:
+
+```bash
+node simulate.js <subscriptionId> <signingSecret>
+```
+
+This script:
+1. Starts a local receiver server on port 4000 (acts as your callback URL)
+2. Sends 5 HMAC-signed webhook events (Stripe, GitHub, Shopify, etc.) to the platform
+3. Shows real-time logs of forwarded events received at the callback
+
+For testing against the deployed version:
+
+```bash
+PLATFORM_URL=https://webhook-platform-backend-production.up.railway.app node simulate.js <subscriptionId> <secret>
+```
+
+---
+
+## Project Structure
+
+```
+src/
+  auth/            # JWT authentication (register, login, guards)
+  users/           # User entity and service
+  webhooks/
+    entities/       # WebhookSubscription, WebhookEvent (TypeORM)
+    dto/            # Validation DTOs (class-validator)
+    webhooks.*      # Subscription CRUD
+    events.*        # Event ingestion, listing, retry, SSE streaming
+    delivery.*      # BullMQ processor -- delivers to callback URLs
+  common/
+    filters/        # Global exception filter
+    decorators/     # @CurrentUser, @RawBody
+```
+
+---
+
+## Related
+
+- **Frontend repo:** https://github.com/Dhruv-Gupta01/webhook-platform-frontend
